@@ -78,7 +78,11 @@ def load_maccrobat() -> List[Document]:
     are confirmed in notebook 01's EDA cell; if they differ, update the
     accessors below (kept narrow so drift is loud).
     """
-    ds = load_dataset("singh-aditya/MACCROBAT_biomedical_ner", split="train")
+    ds = load_dataset(
+        "singh-aditya/MACCROBAT_biomedical_ner",
+        split="train",
+        trust_remote_code=True,
+    )
     label_names = ds.features["ner_tags"].feature.names
 
     docs: List[Document] = []
@@ -288,7 +292,11 @@ def load_bioleaflets(max_examples: int = 2000) -> List[dict]:
     signal. Note the trade-off in notebook 01.
     """
     try:
-        ds = load_dataset("ruslan/bioleaflets-biomedical-ner", split="train")
+        ds = load_dataset(
+            "ruslan/bioleaflets-biomedical-ner",
+            split="train",
+            trust_remote_code=True,
+        )
     except Exception as exc:
         print(f"[bioleaflets] load failed: {exc}; skipping")
         return []
