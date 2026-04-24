@@ -52,7 +52,11 @@ def train(cfg: Optional[TrainConfig] = None):
     # so `import train` works on machines without a GPU (for tests / linting).
     from unsloth import FastLanguageModel
     from datasets import load_dataset
-    from trl import SFTConfig, SFTTrainer
+    from transformers import (
+        Trainer,
+        TrainingArguments,
+        DataCollatorForLanguageModeling,
+    )
 
     print(f"Loading {cfg.model_name} in 4-bit...")
     model, tokenizer = FastLanguageModel.from_pretrained(
@@ -80,11 +84,6 @@ def train(cfg: Optional[TrainConfig] = None):
         "parquet",
         data_files={"train": str(cfg.train_path), "val": str(cfg.val_path)},
     )
-    # Build the chat-templated `text`, then pre-tokenize into
-    # input_ids/attention_mask. Pre-tokenising is more robust than relying
-    # on the TRL SFTTrainer's on-the-fly tokenisation path, which can
-    # collide with the default DataCollatorForLanguageModeling when string
-    # columns survive into collation.
     raw_cols = ds["train"].column_names
 
     def _prep(ex):
@@ -103,7 +102,7 @@ def train(cfg: Optional[TrainConfig] = None):
     print(f"  columns: {ds['train'].column_names}")
 
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
-    args = SFTConfig(
+    args = TrainingArguments(
         output_dir=str(cfg.output_dir),
         per_device_train_batch_size=cfg.per_device_train_batch_size,
         gradient_accumulation_steps=cfg.gradient_accumulation_steps,
@@ -119,23 +118,19 @@ def train(cfg: Optional[TrainConfig] = None):
         save_total_limit=3,
         report_to="none",
         seed=cfg.seed,
-        packing=False,
+        bf16=True,
+        remove_unused_columns=False,
     )
 
-    # Pre-tokenised dataset -> pad with a language-model collator.
-    from transformers import DataCollatorForLanguageModeling
-    collator = DataCollatorForLanguageModeling(
-        tokenizer=tokenizer,
-        mlm=False,
-    )
+    collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
 
-    trainer = SFTTrainer(
+    trainer = Trainer(
         model=model,
-        tokenizer=tokenizer,
+        args=args,
         train_dataset=ds["train"],
         eval_dataset=ds["val"],
-        args=args,
         data_collator=collator,
+        tokenizer=tokenizer,
     )
     trainer.train()
 
