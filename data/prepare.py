@@ -305,15 +305,21 @@ POSOLOGY_MARKERS = re.compile(
 
 
 def load_bioleaflets(max_examples: int = 2000) -> List[dict]:
-    """Load BioLeaflets, filter to posology sections, return sentence examples.
+    """Load BioLeaflets, extract sentence-level posology examples.
 
-    The dataset doesn't carry medication-attribute annotations compatible with
-    our schema, so we treat the leaflet text as a source of naturalistic
-    patient-facing dosage language and re-annotate with a lightweight
-    regex-based extractor for known dose / route / frequency patterns. This
-    is NOISY by design — these examples exist for style coverage, not gold
-    signal. Note the trade-off in notebook 01.
+    Schema observed: `{ID, URL, Product_Name, Full_Content, Section_1..6}`
+    where Section_3 is consistently the "how to use" / posology section and
+    Section_2 covers warnings+interactions. We use Section_3 as the posology
+    source; it's stringified Python dicts we have to literal_eval.
+
+    The dataset doesn't carry medication-attribute annotations compatible
+    with our schema, so we re-annotate with a lightweight regex extractor.
+    The important advantage over pure regex: we know `Product_Name` for each
+    leaflet, so the "drug" field is the actual product, not a
+    longest-capitalised-word guess. These examples are NOISY but provide
+    patient-facing posology style that MACCROBAT's clinical prose doesn't.
     """
+    import ast
     try:
         from datasets import load_dataset
         ds = load_dataset("ruslan/bioleaflets-biomedical-ner", split="train")
@@ -323,17 +329,25 @@ def load_bioleaflets(max_examples: int = 2000) -> List[dict]:
 
     examples: List[dict] = []
     for row in ds:
-        text_field = row.get("text") or row.get("document") or ""
-        if not text_field or not POSOLOGY_MARKERS.search(text_field):
+        product = row.get("Product_Name") or ""
+        section_raw = row.get("Section_3") or ""
+        if not section_raw:
             continue
-        for sent in _simple_sentence_split(text_field):
-            target = _regex_extract_medication(sent)
+        try:
+            section = ast.literal_eval(section_raw)
+            content = section.get("Section_Content", "") if isinstance(section, dict) else ""
+        except (SyntaxError, ValueError):
+            continue
+        if not content:
+            continue
+        for sent in _simple_sentence_split(content):
+            target = _regex_extract_medication(sent, product_name=product)
             if target["medications"]:
                 examples.append({
                     "input": sent,
                     "target": json.dumps(target, ensure_ascii=False),
                     "source": "bioleaflets",
-                    "doc_id": str(row.get("id", "")),
+                    "doc_id": str(row.get("ID", "")),
                 })
         if len(examples) >= max_examples:
             break
@@ -346,23 +360,40 @@ def _simple_sentence_split(text: str) -> List[str]:
 
 _DOSE_RE = re.compile(r"\b\d+(?:\.\d+)?\s?(?:mg|g|mcg|ml|unit[s]?|iu|tablet[s]?|capsule[s]?)\b", re.I)
 _FREQ_RE = re.compile(r"\b(?:once|twice|three times|four times|every\s+\d+\s+hours?|daily|bid|tid|qid|prn)\b", re.I)
-_ROUTE_RE = re.compile(r"\b(?:by mouth|oral(?:ly)?|intravenous(?:ly)?|iv|po|subcutaneous(?:ly)?|sc|intramuscular(?:ly)?|im|topical(?:ly)?)\b", re.I)
+_ROUTE_RE = re.compile(r"\b(?:by mouth|oral(?:ly)?|intravenous(?:ly)?|iv|po|subcutaneous(?:ly)?|sc|intramuscular(?:ly)?|im|topical(?:ly)?|injection)\b", re.I)
 _DURATION_RE = re.compile(r"\bfor\s+\d+\s+(?:day[s]?|week[s]?|month[s]?)\b", re.I)
 
 
-def _regex_extract_medication(sentence: str) -> dict:
-    """Very lightweight: flag a sentence as having a medication if it has a
-    dose pattern; otherwise skip. Drug name is left as the longest
-    capitalised word (weak heuristic — fine because this is augmentation
-    signal, not gold test data)."""
+def _regex_extract_medication(sentence: str, product_name: str = "") -> dict:
+    """Return a single-drug extraction if the sentence contains a dose
+    pattern AND a drug name that actually appears in the sentence.
+
+    Drug-name selection (in order):
+      1. `product_name` if it appears in the sentence (case-insensitive).
+      2. The longest capitalised word from the sentence itself (>=3 chars).
+      3. Otherwise skip — training on a drug name absent from the input
+         would teach the model to hallucinate.
+    """
     dose = _DOSE_RE.search(sentence)
     if not dose:
         return {"medications": []}
+
+    drug_name = ""
+    pn = product_name.strip()
+    if pn and pn.lower() in sentence.lower():
+        # match case as found in the sentence for fidelity
+        idx = sentence.lower().find(pn.lower())
+        drug_name = sentence[idx:idx + len(pn)]
+    else:
+        caps = re.findall(r"\b[A-Z][a-z]{2,}\b", sentence)
+        if caps:
+            drug_name = max(caps, key=len)
+    if not drug_name:
+        return {"medications": []}
+
     freq = _FREQ_RE.search(sentence)
     route = _ROUTE_RE.search(sentence)
     duration = _DURATION_RE.search(sentence)
-    caps = re.findall(r"\b[A-Z][a-z]{2,}\b", sentence)
-    drug_name = max(caps, key=len) if caps else "unknown"
     return {"medications": [{
         "drug": drug_name,
         "dose": dose.group(0) if dose else None,
