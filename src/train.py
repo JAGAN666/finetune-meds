@@ -80,8 +80,16 @@ def train(cfg: Optional[TrainConfig] = None):
         "parquet",
         data_files={"train": str(cfg.train_path), "val": str(cfg.val_path)},
     )
-    ds = ds.map(lambda ex: format_for_training(ex, tokenizer))
+    # Map to a single `text` column and drop everything else. The default
+    # SFTTrainer collator tries to tensorize every column; leaving the raw
+    # string fields (`input`, `target`, ...) in place crashes during padding.
+    raw_cols = ds["train"].column_names
+    ds = ds.map(
+        lambda ex: format_for_training(ex, tokenizer),
+        remove_columns=raw_cols,
+    )
     print(f"  train: {len(ds['train'])} examples; val: {len(ds['val'])} examples")
+    print(f"  columns: {ds['train'].column_names}")
 
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
     args = SFTConfig(
