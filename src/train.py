@@ -80,14 +80,25 @@ def train(cfg: Optional[TrainConfig] = None):
         "parquet",
         data_files={"train": str(cfg.train_path), "val": str(cfg.val_path)},
     )
-    # Map to a single `text` column and drop everything else. The default
-    # SFTTrainer collator tries to tensorize every column; leaving the raw
-    # string fields (`input`, `target`, ...) in place crashes during padding.
+    # Build the chat-templated `text`, then pre-tokenize into
+    # input_ids/attention_mask. Pre-tokenising is more robust than relying
+    # on the TRL SFTTrainer's on-the-fly tokenisation path, which can
+    # collide with the default DataCollatorForLanguageModeling when string
+    # columns survive into collation.
     raw_cols = ds["train"].column_names
-    ds = ds.map(
-        lambda ex: format_for_training(ex, tokenizer),
-        remove_columns=raw_cols,
-    )
+
+    def _prep(ex):
+        text = format_for_training(ex, tokenizer)["text"]
+        enc = tokenizer(
+            text,
+            truncation=True,
+            max_length=cfg.max_seq_len,
+            add_special_tokens=False,
+        )
+        enc["labels"] = enc["input_ids"].copy()
+        return enc
+
+    ds = ds.map(_prep, remove_columns=raw_cols)
     print(f"  train: {len(ds['train'])} examples; val: {len(ds['val'])} examples")
     print(f"  columns: {ds['train'].column_names}")
 
@@ -108,9 +119,14 @@ def train(cfg: Optional[TrainConfig] = None):
         save_total_limit=3,
         report_to="none",
         seed=cfg.seed,
-        dataset_text_field="text",
-        max_seq_length=cfg.max_seq_len,
         packing=False,
+    )
+
+    # Pre-tokenised dataset -> pad with a language-model collator.
+    from transformers import DataCollatorForLanguageModeling
+    collator = DataCollatorForLanguageModeling(
+        tokenizer=tokenizer,
+        mlm=False,
     )
 
     trainer = SFTTrainer(
@@ -119,6 +135,7 @@ def train(cfg: Optional[TrainConfig] = None):
         train_dataset=ds["train"],
         eval_dataset=ds["val"],
         args=args,
+        data_collator=collator,
     )
     trainer.train()
 
