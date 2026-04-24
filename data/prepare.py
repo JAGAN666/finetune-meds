@@ -21,14 +21,19 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
 import pandas as pd
-from datasets import load_dataset
 
 DATA_DIR = Path(__file__).parent
+CACHE_DIR = DATA_DIR / ".cache"
+MACCROBAT_URL = (
+    "https://huggingface.co/datasets/singh-aditya/MACCROBAT_biomedical_ner/"
+    "resolve/main/MACCROBAT2020-V2.json"
+)
 
 # MACCROBAT entity names vary slightly across documents and conversions
 # (e.g. some annotators used `Medication`, others `Drug`). Normalise to our
@@ -46,22 +51,28 @@ ENTITY_ALIASES: dict[str, str] = {
     "form": None,  # kept out on purpose — "tablet" / "capsule" isn't in our schema
 }
 
-SENTENCE_TERMINATORS = {".", "?", "!", ";"}
-CLAUSE_BOUNDARY_TOKENS = {",", ";", "then", "and", "also", "additionally", "subsequently"}
+SENTENCE_TERMINATOR_RE = re.compile(r"(?<=[.!?;])\s+")
+# clause boundaries inside a sentence — used to penalise attribute-to-drug
+# assignments that cross a clause. The `,` + optional connector pattern
+# catches "... for 2 weeks, then add ...". Bare `;` is also a boundary.
+CLAUSE_BOUNDARY_RE = re.compile(
+    r",\s*(?:then|and|also|additionally|subsequently)\b|;|\n",
+    re.IGNORECASE,
+)
 
 
 @dataclass
 class Entity:
-    start: int        # inclusive token index
-    end: int          # exclusive token index
+    start: int        # character offset into `full_text`, inclusive
+    end: int          # character offset, exclusive
     kind: str         # normalised: drug | dose | route | frequency | duration
-    text: str         # surface form (joined token text)
+    text: str         # surface form
 
 
 @dataclass
 class Document:
     doc_id: str
-    tokens: List[str]
+    full_text: str
     entities: List[Entity]
 
 
@@ -69,63 +80,79 @@ class Document:
 # MACCROBAT loading + parsing
 # ---------------------------------------------------------------------------
 
-def load_maccrobat() -> List[Document]:
-    """Load MACCROBAT from HF and convert to internal Document objects.
-
-    The HF dataset from `singh-aditya/MACCROBAT_biomedical_ner` exposes one
-    row per document with fields `tokens`, `ner_tags` (BIO-encoded ints), and
-    a `ner_labels` feature that maps tag int -> tag string. Exact field names
-    are confirmed in notebook 01's EDA cell; if they differ, update the
-    accessors below (kept narrow so drift is loud).
+def _download_with_ssl_fallback(url: str, dest: Path) -> None:
+    """Download `url` -> `dest`. Falls back to `certifi`'s bundle on Macs
+    where the system Python doesn't have root certs configured.
     """
-    ds = load_dataset(
-        "singh-aditya/MACCROBAT_biomedical_ner",
-        split="train",
-        trust_remote_code=True,
-    )
-    label_names = ds.features["ner_tags"].feature.names
+    import ssl
+    try:
+        urllib.request.urlretrieve(url, dest)
+        return
+    except (urllib.error.URLError, ssl.SSLError) as exc:
+        if "CERTIFICATE_VERIFY_FAILED" not in str(exc):
+            raise
+    # SSL verify failed — retry with certifi if available
+    try:
+        import certifi
+    except ImportError as e:
+        raise RuntimeError(
+            "SSL cert verification failed and `certifi` isn't installed. "
+            "Run `pip install certifi` or install Mac's Python root certs via "
+            "`/Applications/Python\\ 3.X/Install\\ Certificates.command`."
+        ) from e
+    ctx = ssl.create_default_context(cafile=certifi.where())
+    opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
+    with opener.open(url) as resp, open(dest, "wb") as f:
+        while chunk := resp.read(1 << 16):
+            f.write(chunk)
+
+
+def load_maccrobat() -> List[Document]:
+    """Load MACCROBAT by fetching the raw JSON from Hugging Face directly.
+
+    We bypass `datasets.load_dataset` on purpose — the repo ships a loading
+    script which `datasets>=3.0` refuses to execute. The raw JSON
+    (`MACCROBAT2020-V2.json`, ~8 MB) is public and self-contained, so a
+    plain HTTPS download is both simpler and version-agnostic.
+
+    The file's shape:
+      {
+        "data": [{"full_text": str, "ner_info": [{text, label, start, end}, ...],
+                  "tokens": [...], "ner_labels": [...]}, ...],
+        "all_ner_labels": [...],
+        ...
+      }
+
+    We use `ner_info` directly (char-offset spans on `full_text`), which
+    dodges the tokenisation quirks of the `tokens` field (which includes
+    whitespace-only tokens).
+    """
+    CACHE_DIR.mkdir(exist_ok=True)
+    cached = CACHE_DIR / "MACCROBAT2020-V2.json"
+    if not cached.exists():
+        print(f"Downloading {MACCROBAT_URL} -> {cached}")
+        _download_with_ssl_fallback(MACCROBAT_URL, cached)
+
+    with open(cached) as f:
+        raw = json.load(f)
 
     docs: List[Document] = []
-    for idx, row in enumerate(ds):
-        tokens = row["tokens"]
-        tag_ids = row["ner_tags"]
-        tag_strs = [label_names[t] for t in tag_ids]
-        entities = _bio_to_entities(tokens, tag_strs)
-        doc_id = row.get("id") or f"maccrobat_{idx:04d}"
-        docs.append(Document(doc_id=str(doc_id), tokens=tokens, entities=entities))
-    return docs
-
-
-def _bio_to_entities(tokens: List[str], tags: List[str]) -> List[Entity]:
-    entities: List[Entity] = []
-    i = 0
-    while i < len(tags):
-        tag = tags[i]
-        if tag == "O" or tag == "0":
-            i += 1
-            continue
-        # BIO prefix handling: strip B-/I- to get the entity type
-        prefix, _, kind_raw = tag.partition("-")
-        if not kind_raw:  # dataset may store bare labels without B-/I-
-            kind_raw = tag
-        kind = ENTITY_ALIASES.get(kind_raw.lower())
-        if kind is None:
-            i += 1
-            continue
-        start = i
-        i += 1
-        while i < len(tags):
-            nxt = tags[i]
-            nxt_prefix, _, nxt_kind_raw = nxt.partition("-")
-            nxt_kind = ENTITY_ALIASES.get((nxt_kind_raw or nxt).lower())
-            if nxt_prefix == "I" and nxt_kind == kind:
-                i += 1
+    for idx, item in enumerate(raw["data"]):
+        full_text = item["full_text"]
+        entities: List[Entity] = []
+        for info in item["ner_info"]:
+            kind = ENTITY_ALIASES.get(info["label"].lower())
+            if kind is None:
                 continue
-            break
-        end = i
-        text = " ".join(tokens[start:end])
-        entities.append(Entity(start=start, end=end, kind=kind, text=text))
-    return entities
+            entities.append(Entity(
+                start=info["start"],
+                end=info["end"],
+                kind=kind,
+                text=info["text"],
+            ))
+        doc_id = f"maccrobat_{idx:04d}"
+        docs.append(Document(doc_id=doc_id, full_text=full_text, entities=entities))
+    return docs
 
 
 # ---------------------------------------------------------------------------
@@ -133,34 +160,34 @@ def _bio_to_entities(tokens: List[str], tags: List[str]) -> List[Entity]:
 # ---------------------------------------------------------------------------
 
 def split_into_sentences(doc: Document) -> List[Tuple[int, int]]:
-    """Return list of (start, end) token-index spans, one per sentence."""
+    """Return (char_start, char_end) spans of each sentence in full_text."""
+    text = doc.full_text
     spans: List[Tuple[int, int]] = []
     start = 0
-    for i, tok in enumerate(doc.tokens):
-        if tok in SENTENCE_TERMINATORS:
-            spans.append((start, i + 1))
-            start = i + 1
-    if start < len(doc.tokens):
-        spans.append((start, len(doc.tokens)))
-    return [s for s in spans if s[1] > s[0]]
+    for m in SENTENCE_TERMINATOR_RE.finditer(text):
+        end = m.start()
+        if end > start:
+            spans.append((start, end))
+        start = m.end()
+    if start < len(text):
+        spans.append((start, len(text)))
+    return spans
 
 
 def group_entities_in_sentence(
-    sentence_tokens: List[str],
+    sentence_text: str,
     entities: List[Entity],
     sent_start: int,
 ) -> dict:
-    """Clause-aware proximity grouping: each Medication anchors a
-    {drug, dose, route, frequency, duration} object; each non-drug entity
-    attaches to the best drug by (token distance × clause-crossing penalty).
+    """Clause-aware proximity grouping on character offsets.
 
-    Crossing a clause boundary (comma, semicolon, "then", "and", "also",
-    "additionally", "subsequently") is penalised 10× so that
+    Each Medication anchors a {drug, dose, route, frequency, duration}
+    object; each non-drug entity attaches to the best drug by
+    (char distance x clause-crossing penalty). Crossing a clause boundary
+    (comma followed by then/and/also/additionally/subsequently; or ';'
+    or a newline) is penalised 10x so that
     "metoprolol ... for 2 weeks, then add lisinopril" correctly assigns
-    "2 weeks" to metoprolol even though lisinopril is closer in raw
-    token distance.
-
-    If there are zero drugs: return {"medications": []}.
+    "2 weeks" to metoprolol even though lisinopril is closer in raw chars.
     """
     drugs = [e for e in entities if e.kind == "drug"]
     others = [e for e in entities if e.kind != "drug"]
@@ -168,9 +195,10 @@ def group_entities_in_sentence(
     if not drugs:
         return {"medications": []}
 
+    # clause-boundary char offsets *relative to full_text* — same frame as
+    # Entity.start/end, so we can compare directly.
     boundary_positions = [
-        i for i, tok in enumerate(sentence_tokens)
-        if tok.lower() in CLAUSE_BOUNDARY_TOKENS
+        sent_start + m.start() for m in CLAUSE_BOUNDARY_RE.finditer(sentence_text)
     ]
 
     med_objs: List[dict] = []
@@ -203,7 +231,6 @@ def _assignment_cost(attr_mid: float, drug_mid: float, boundaries: List[int], dr
     lo, hi = sorted([attr_mid, drug_mid])
     crossings = sum(1 for b in boundaries if lo < b < hi)
     distance = abs(attr_mid - drug_mid)
-    # sort key: (penalised cost, stable tiebreaker on drug index)
     return (distance * (1 + 10 * crossings), drug_idx)
 
 
@@ -247,23 +274,19 @@ def doc_to_examples(doc: Document, keep_negative_fraction: float = 0.10) -> List
     out: List[dict] = []
     neg_keep_counter = 0
     for sent_idx, (start, end) in enumerate(split_into_sentences(doc)):
-        sent_toks = doc.tokens[start:end]
+        sent_text = doc.full_text[start:end].strip()
+        if not sent_text:
+            continue
         sent_entities = [
-            Entity(start=e.start - start, end=e.end - start, kind=e.kind, text=e.text)
-            for e in doc.entities
-            if e.start >= start and e.end <= end
+            e for e in doc.entities if e.start >= start and e.end <= end
         ]
-        target = group_entities_in_sentence(sent_toks, sent_entities, start)
+        target = group_entities_in_sentence(sent_text, sent_entities, start)
         if not target["medications"]:
-            # keep roughly `keep_negative_fraction` of no-med sentences
             neg_keep_counter += 1
             if neg_keep_counter % int(1 / keep_negative_fraction) != 0:
                 continue
-        text = " ".join(sent_toks).strip()
-        if not text:
-            continue
         out.append({
-            "input": text,
+            "input": sent_text,
             "target": json.dumps(target, ensure_ascii=False),
             "source": "maccrobat",
             "doc_id": doc.doc_id,
@@ -292,11 +315,8 @@ def load_bioleaflets(max_examples: int = 2000) -> List[dict]:
     signal. Note the trade-off in notebook 01.
     """
     try:
-        ds = load_dataset(
-            "ruslan/bioleaflets-biomedical-ner",
-            split="train",
-            trust_remote_code=True,
-        )
+        from datasets import load_dataset
+        ds = load_dataset("ruslan/bioleaflets-biomedical-ner", split="train")
     except Exception as exc:
         print(f"[bioleaflets] load failed: {exc}; skipping")
         return []
